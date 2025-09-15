@@ -1,0 +1,5 @@
+{
+  "reminders": [
+    { "channelId": "", "cron": "0 12 * * *", "message": "Pense à ajouter des sons avec /add !" }
+  ]
+}
