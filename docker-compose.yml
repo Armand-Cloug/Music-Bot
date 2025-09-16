@@ -1,0 +1,24 @@
+# docker-compose.yml
+services:
+  bot:
+    build: .
+    image: music-bot:latest
+    container_name: music-bot
+    restart: unless-stopped
+    environment:
+      # == OBLIGATOIRES ==
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      # == OPTIONNELS ==
+      YOUTUBE_COOKIE: ${YOUTUBE_COOKIE}
+      TZ: Europe/Paris
+    volumes:
+      - ./data:/app/data
+
+  # Service utilitaire pour (re)déployer les commandes slash
+  deploy-commands:
+    image: music-bot:latest
+    profiles: ["tools"]   # ne se lance pas par défaut
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      GUILD_ID: ${GUILD_ID}  # ta guilde de test
+    entrypoint: ["npm", "run", "deploy:cmd"]
