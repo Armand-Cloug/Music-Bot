@@ -57,11 +57,10 @@ async function makeCookiesTxtFromEnv() {
 }
 
 async function fetchTitleWithYtDlp(url) {
-  try {
-    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari'
-    const made = await makeCookiesTxtFromEnv()
-    const bin = await resolveYtDlpPath()
-
+  // On tente tv_embedded (souvent + permissif), puis web
+  const bin = await resolveYtDlpPath()
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari'
+  const tryOnce = async (client, cookieFile) => {
     const args = [
       '--dump-single-json',
       '--no-playlist',
@@ -70,36 +69,39 @@ async function fetchTitleWithYtDlp(url) {
       '--no-progress',
       '--force-ipv4',
       '--user-agent', ua,
-      '--extractor-args', 'youtube:player_client=web'
+      '--extractor-args', `youtube:player_client=${client}`
     ]
-    if (made?.cookieFile) {
-      args.push('--cookies', made.cookieFile)
-    }
+    if (cookieFile) args.push('--cookies', cookieFile)
     args.push(url)
 
-    const y = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    return await new Promise((res) => {
+      const y = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = '', err = ''
+      y.stdout.on('data', d => (out += d.toString()))
+      y.stderr.on('data', d => (err += d.toString()))
+      y.on('close', code => {
+        if (code === 0) {
+          try { const json = JSON.parse(out || '{}'); res(json?.title || null) }
+          catch { res(null) }
+        } else {
+          console.warn(`[yt-dlp:title ${client}] exit ${code}\n${err || '(stderr empty)'}`)
+          res(null)
+        }
+      })
+    })
+  }
 
-    let out = ''
-    let err = ''
-    y.stdout.on('data', d => (out += d.toString()))
-    y.stderr.on('data', d => (err += d.toString()))
-
-    const code = await new Promise(res => y.on('close', res))
-
-    if (made?.cookieFile) {
-      try { await fsp.rm(made.cookieFile, { force: true }) } catch {}
-      try { await fsp.rm(made.tmpdir, { recursive: true, force: true }) } catch {}
-    }
-
-    if (code !== 0) {
-      console.warn('[yt-dlp:title] exit', code, '\n', err || '(stderr empty)')
-      return null
-    }
-
-    const json = JSON.parse(out || '{}')
-    return json?.title || null
-  } catch {
-    return null
+  const made = await makeCookiesTxtFromEnv()
+  try {
+    // A) tv_embedded (sans cookies)
+    let title = await tryOnce('tv_embedded', null)
+    if (title) return title
+    // B) web (avec cookies)
+    title = await tryOnce('web', made?.cookieFile || null)
+    return title
+  } finally {
+    if (made?.cookieFile) try { await fsp.rm(made.cookieFile, { force: true }) } catch {}
+    if (made?.tmpdir) try { await fsp.rm(made.tmpdir, { recursive: true, force: true }) } catch {}
   }
 }
 
@@ -147,15 +149,12 @@ class GuildMusic {
   async add(url, requestedBy) {
     if (!url || typeof url !== 'string') throw new Error('URL manquante.')
 
-    // ✅ validation simple sans play-dl
     const id = extractYouTubeId(url)
     if (!id) throw new Error('Lien YouTube invalide (pas une vidéo).')
 
-    // Titre provisoire
     let title = 'Vidéo YouTube'
     let durationText = '—'
 
-    // Mise à jour asynchrone du titre via yt-dlp (si dispo)
     fetchTitleWithYtDlp(url).then(t => {
       if (t) {
         const entry = this.queue.find(q => q.url === url && q.requestedBy === requestedBy)
@@ -187,7 +186,7 @@ class GuildMusic {
       return
     }
 
-    // 1) Fallback @distube/ytdl-core (cookies au nouveau format)
+    // 1) @distube/ytdl-core (avec cookies) — peut échouer sur 429 : on ignore et on file sur yt-dlp
     try {
       const undici = await import('undici')
       if (undici?.File && !globalThis.File) globalThis.File = undici.File
@@ -232,91 +231,89 @@ class GuildMusic {
       console.error('@distube/ytdl-core failed, trying yt-dlp:', e, '\nURL =', current.url)
     }
 
-    // 2) Fallback final : yt-dlp CLI (2 essais : web+cookies puis tv_embedded sans cookies)
+    // 2) yt-dlp — Essai A: tv_embedded (SANS cookies), formats relaxés
     try {
-      const bin = await resolveYtDlpPath()
-      const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari'
-
-      // ----- Essai A : client web + cookies -----
-      let made = await makeCookiesTxtFromEnv()
-      let args = [
-        '-f', 'bestaudio[ext=webm]/bestaudio/best',
-        '--no-playlist',
-        '--no-check-certificate',
-        '--ignore-config',
-        '--no-progress',
-        '--force-ipv4',
-        '--user-agent', ua,
-        '--extractor-args', 'youtube:player_client=web'
-      ]
-      if (made?.cookieFile) {
-        args.push('--cookies', made.cookieFile)
-      }
-      args.push('-o', '-')
-      args.push(current.url)
-
-      console.log('[yt-dlp] spawn (web):', [bin, ...args].join(' '))
-      let ytdlp = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
-
-      let stderrBuf = ''
-      ytdlp.stderr.on('data', d => { stderrBuf += d.toString() })
-      ytdlp.on('error', err => { console.error('yt-dlp spawn error:', err) })
-
-      try {
-        const { stream, type } = await demuxProbe(ytdlp.stdout)
-        const resource = createAudioResource(stream, { inputType: type })
-        this.player.play(resource)
-        ytdlp.on('close', async code => {
-          if (code && code !== 0) {
-            console.warn('yt-dlp exited with code', code, '\nlast stderr:\n', stderrBuf || '(empty)')
-          }
-          try { await fsp.rm(made?.cookieFile ?? '', { force: true }) } catch {}
-          try { await fsp.rm(made?.tmpdir ?? '', { force: true, recursive: true }) } catch {}
-        })
-        return
-      } catch (probeErr) {
-        // stoppe le process web et nettoie
-        try { ytdlp.kill('SIGKILL') } catch {}
-        try { await fsp.rm(made?.cookieFile ?? '', { force: true }) } catch {}
-        try { await fsp.rm(made?.tmpdir ?? '', { force: true, recursive: true }) } catch {}
-        console.warn('[yt-dlp] web attempt failed, stderr:', stderrBuf || '(empty)')
-      }
-
-      // ----- Essai B : client tv_embedded (souvent plus permissif), SANS cookies -----
-      args = [
-        '-f', 'bestaudio[ext=webm]/bestaudio/best',
-        '--no-playlist',
-        '--no-check-certificate',
-        '--ignore-config',
-        '--no-progress',
-        '--force-ipv4',
-        '--user-agent', ua,
-        '--extractor-args', 'youtube:player_client=tv_embedded',
-        '-o', '-',
-        current.url
-      ]
-
-      console.log('[yt-dlp] spawn (tv_embedded):', [bin, ...args].join(' '))
-      ytdlp = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
-
-      stderrBuf = ''
-      ytdlp.stderr.on('data', d => { stderrBuf += d.toString() })
-      ytdlp.on('error', err => { console.error('yt-dlp spawn error:', err) })
-
-      const { stream, type } = await demuxProbe(ytdlp.stdout)
-      const resource = createAudioResource(stream, { inputType: type })
-      this.player.play(resource)
-      ytdlp.on('close', async code => {
-        if (code && code !== 0) {
-          console.warn('yt-dlp exited with code', code, '\nlast stderr:\n', stderrBuf || '(empty)')
-        }
+      await this._playWithYtDlp(current.url, {
+        client: 'tv_embedded',
+        useCookies: false
       })
       return
     } catch (e) {
-      console.error('yt-dlp fallback failed, skipping:', e, '\nURL =', current.url)
-      this.queue.shift()
-      if (this.queue.length > 0) return this.playNext()
-      this.player.stop(true)
+      console.warn('[yt-dlp] tv_embedded failed:', e?.message || e)
+    }
+
+    // 3) yt-dlp — Essai B: web (AVEC cookies), formats relaxés
+    try {
+      await this._playWithYtDlp(current.url, {
+        client: 'web',
+        useCookies: true
+      })
+      return
+    } catch (e) {
+      console.warn('[yt-dlp] web failed:', e?.message || e)
+    }
+
+    // 4) yt-dlp — Essai C: ios (AVEC cookies), formats relaxés
+    try {
+      await this._playWithYtDlp(current.url, {
+        client: 'ios',
+        useCookies: true
+      })
+      return
+    } catch (e) {
+      console.warn('[yt-dlp] ios failed:', e?.message || e)
+    }
+
+    // Échec total : on skip
+    console.error('yt-dlp fallback failed, skipping:', '\nURL =', current.url)
+    this.queue.shift()
+    if (this.queue.length > 0) return this.playNext()
+    this.player.stop(true)
+  }
+
+  async _playWithYtDlp(url, { client, useCookies }) {
+    const bin = await resolveYtDlpPath()
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari'
+
+    // Formats RELAXÉS : on n’impose plus webm — laisse yt-dlp choisir le meilleur audio dispo
+    const baseArgs = [
+      '-f', 'bestaudio/best',
+      '--no-playlist',
+      '--no-check-certificate',
+      '--ignore-config',
+      '--no-progress',
+      '--force-ipv4',
+      '--hls-prefer-ffmpeg',
+      '--user-agent', ua,
+      '--extractor-args', `youtube:player_client=${client}`,
+      '-o', '-',
+      url
+    ]
+
+    // Cookies si demandés
+    let made = null
+    if (useCookies) {
+      made = await makeCookiesTxtFromEnv()
+      if (made?.cookieFile) baseArgs.splice(baseArgs.length - 2, 0, '--cookies', made.cookieFile)
+    }
+
+    console.log(`[yt-dlp] spawn (${client}):`, [bin, ...baseArgs].join(' '))
+    const ytdlp = spawn(bin, baseArgs, { stdio: ['ignore', 'pipe', 'pipe'] })
+
+    let stderrBuf = ''
+    ytdlp.stderr.on('data', d => { stderrBuf += d.toString() })
+    ytdlp.on('error', err => { console.error('yt-dlp spawn error:', err) })
+
+    try {
+      const { stream, type } = await demuxProbe(ytdlp.stdout)
+      const resource = createAudioResource(stream, { inputType: type })
+      this.player.play(resource)
+    } catch (probeErr) {
+      try { ytdlp.kill('SIGKILL') } catch {}
+      throw new Error(stderrBuf || String(probeErr))
+    } finally {
+      if (made?.cookieFile) try { await fsp.rm(made.cookieFile, { force: true }) } catch {}
+      if (made?.tmpdir) try { await fsp.rm(made.tmpdir, { recursive: true, force: true }) } catch {}
     }
   }
 
